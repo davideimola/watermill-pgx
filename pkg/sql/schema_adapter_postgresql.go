@@ -143,13 +143,17 @@ func (s DefaultPostgreSQLSchema) SelectQuery(topic string, consumerGroup string,
 	//Planning Time: 1.365 ms
 	//Execution Time: 0.786 ms
 
+	// transaction_id is cast to text only in the outer select, under a name of
+	// its own: ORDER BY resolves a bare name to an output column first, so an
+	// output column called transaction_id holding text would sort "1000" before
+	// "999" and move the offset past messages that were never delivered.
 	selectQuery := `
-	SELECT * FROM (
+	SELECT "offset", transaction_id::text AS transaction_id_text, uuid, payload, metadata FROM (
 		WITH last_processed AS (
 			` + nextOffsetQuery.Query + `
 		)
 
-		SELECT "offset", transaction_id::text, uuid, payload, metadata FROM ` + s.MessagesTable(topic) + `
+		SELECT "offset", transaction_id, uuid, payload, metadata FROM ` + s.MessagesTable(topic) + `
 
 		WHERE 
 		(
