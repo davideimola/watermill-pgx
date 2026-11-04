@@ -537,3 +537,96 @@ func extractDurationFromAnalyze(t *testing.T, s string) time.Duration {
 
 	return parsed
 }
+
+// TestDefaultPostgreSQLSchema_orders_by_transaction_id_across_a_decimal_digit
+// publishes one message right below a power of ten of the transaction id and a
+// batch right above it. Ordered as text, "1000" sorts before "999": the
+// subscriber acks the newer rows first and the older message is never
+// delivered.
+func TestDefaultPostgreSQLSchema_orders_by_transaction_id_across_a_decimal_digit(t *testing.T) {
+	db := newPgxPostgreSQL(t)
+	schemaAdapter := newPostgresSchemaAdapter(100)
+
+	pub, sub := newPubSub(t, db, "test", schemaAdapter, newPostgresOffsetsAdapter())
+
+	topicName := "topic_" + watermill.NewUUID()
+	require.NoError(t, sub.(message.SubscribeInitializer).SubscribeInitialize(topicName))
+
+	current := currentTransactionID(t, db)
+	boundary := uint64(10)
+	for boundary <= current+10 {
+		boundary *= 10
+	}
+	if boundary-current > maxTransactionIDsToBurn {
+		t.Skipf("transaction id %d is too far from %d to burn the difference", current, boundary)
+	}
+
+	burnTransactionIDs(t, db, boundary-5)
+	older := message.NewMessage(watermill.NewUUID(), []byte("older"))
+	require.NoError(t, pub.Publish(topicName, older))
+
+	burnTransactionIDs(t, db, boundary)
+	newer := make([]*message.Message, 0, 250)
+	for i := 0; i < 250; i++ {
+		newer = append(newer, message.NewMessage(watermill.NewUUID(), []byte(strconv.Itoa(i))))
+	}
+	require.NoError(t, pub.Publish(topicName, newer...))
+
+	var olderDigits, newerDigits int
+	require.NoError(t, db.QueryRow(context.Background(), fmt.Sprintf(
+		`SELECT min(length(transaction_id::text)), max(length(transaction_id::text)) FROM %s`,
+		schemaAdapter.MessagesTable(topicName),
+	)).Scan(&olderDigits, &newerDigits))
+	require.Less(t, olderDigits, newerDigits, "the messages must straddle a decimal digit of the transaction id")
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	messages, err := sub.Subscribe(ctx, topicName)
+	require.NoError(t, err)
+
+	received, all := subscriber.BulkReadWithDeduplication(messages, len(newer)+1, 5*time.Second)
+	assert.True(t, all, "received %d of %d messages", len(received), len(newer)+1)
+	require.NotEmpty(t, received)
+	assert.Equal(t, older.UUID, received[0].UUID, "the message of the older transaction must be delivered first")
+}
+
+// maxTransactionIDsToBurn bounds how long the test may take on a long-lived
+// database, where the next power of ten can be far away.
+const maxTransactionIDsToBurn = 20_000_000
+
+func currentTransactionID(t *testing.T, db *pgxpool.Pool) uint64 {
+	var xid uint64
+	require.NoError(t, db.QueryRow(context.Background(), `SELECT pg_current_xact_id()::text::bigint`).Scan(&xid))
+
+	return xid
+}
+
+// burnTransactionIDs consumes transaction ids until the next transaction is
+// assigned at least target. Every subtransaction that writes takes an id of its
+// own, so one statement can burn many of them.
+func burnTransactionIDs(t *testing.T, db *pgxpool.Pool, target uint64) {
+	for {
+		current := currentTransactionID(t, db)
+		if current+1 >= target {
+			return
+		}
+
+		burn := target - current - 2
+		if burn == 0 {
+			continue
+		}
+
+		_, err := db.Exec(context.Background(), fmt.Sprintf(`DO $$
+			BEGIN
+				CREATE TEMP TABLE IF NOT EXISTS watermill_xid_burn (x int);
+				FOR i IN 1..%d LOOP
+					BEGIN
+						INSERT INTO watermill_xid_burn VALUES (1);
+					EXCEPTION WHEN others THEN NULL;
+					END;
+				END LOOP;
+			END $$`, burn))
+		require.NoError(t, err)
+	}
+}
